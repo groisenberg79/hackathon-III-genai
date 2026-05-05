@@ -1,0 +1,13 @@
+torch
+transformers
+datasets
+peft
+accelerate
+evaluate
+scikit-learn
+pandas
+numpy
+sentence-transformers
+faiss-cpu
+streamlit
+rouge-score
