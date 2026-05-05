@@ -1,5 +1,5 @@
-import numpy as np
 from pathlib import Path
+import numpy as np
 
 from datasets import load_dataset
 from transformers import (
@@ -8,7 +8,6 @@ from transformers import (
     TrainingArguments,
     Trainer,
 )
-from peft import LoraConfig, TaskType, get_peft_model
 from sklearn.metrics import accuracy_score, precision_recall_fscore_support
 
 
@@ -24,7 +23,7 @@ NUM_VALIDATION_EXAMPLES = 1000
 MAX_LENGTH = 128
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-OUTPUT_DIR = PROJECT_ROOT / "models" / "sentiment_classifier_lora"
+OUTPUT_DIR = PROJECT_ROOT / "models" / "sentiment_classifier"
 
 
 # ------------------------------------------------------------
@@ -171,30 +170,13 @@ if __name__ == "__main__":
         },
     )
 
-    print("Configuring LoRA...")
-
-    lora_config = LoraConfig(
-        task_type=TaskType.SEQ_CLS,
-        inference_mode=False,
-        r=8,
-        lora_alpha=16,
-        lora_dropout=0.1,
-        target_modules=["q_lin", "v_lin"],
-        modules_to_save=["classifier", "pre_classifier"],
-    )
-
-    model = get_peft_model(model, lora_config)
-
-    print("Trainable parameters after applying LoRA:")
-    model.print_trainable_parameters()
-
     print("Setting up training arguments...")
 
     training_args = TrainingArguments(
         output_dir=str(OUTPUT_DIR),
         eval_strategy="epoch",
         save_strategy="epoch",
-        learning_rate=1e-4,
+        learning_rate=2e-5,
         per_device_train_batch_size=8,
         per_device_eval_batch_size=8,
         num_train_epochs=2,
@@ -203,7 +185,6 @@ if __name__ == "__main__":
         load_best_model_at_end=True,
         metric_for_best_model="f1",
         report_to="none",
-        dataloader_pin_memory=False,
     )
 
     print("Creating Trainer...")
@@ -216,18 +197,18 @@ if __name__ == "__main__":
         compute_metrics=compute_metrics,
     )
 
-    print("Training model with LoRA...")
+    print("Training model...")
 
     trainer.train()
 
-    print("Evaluating LoRA model...")
+    print("Evaluating model...")
 
     results = trainer.evaluate()
     print(results)
 
-    print("Saving LoRA model and tokenizer...")
+    print("Saving model and tokenizer...")
 
     trainer.save_model(str(OUTPUT_DIR))
     tokenizer.save_pretrained(str(OUTPUT_DIR))
 
-    print(f"Done. LoRA model saved to {OUTPUT_DIR}")
+    print(f"Done. Model saved to {OUTPUT_DIR}")
