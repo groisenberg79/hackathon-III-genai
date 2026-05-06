@@ -12,3 +12,5 @@ faiss-cpu
 streamlit
 rouge-score
 sentencepiece
+requests
+python-dotenv

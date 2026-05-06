@@ -18,13 +18,19 @@ from sklearn.metrics import accuracy_score, precision_recall_fscore_support
 
 MODEL_NAME = "distilbert-base-uncased"
 
-NUM_TRAIN_EXAMPLES = 6000
-NUM_VALIDATION_EXAMPLES = 1000
+# Random sample sizes.
+# This is the same general approach as the earlier successful LoRA run,
+# but with more examples.
+NUM_TRAIN_EXAMPLES = 10000
+NUM_VALIDATION_EXAMPLES = 1500
 
 MAX_LENGTH = 128
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-OUTPUT_DIR = PROJECT_ROOT / "models" / "sentiment_classifier_lora"
+
+# IMPORTANT:
+# Save this experiment to a new folder so we do not overwrite the previous model.
+OUTPUT_DIR = PROJECT_ROOT / "models" / "sentiment_classifier_lora_random_10k"
 
 
 # ------------------------------------------------------------
@@ -44,6 +50,11 @@ def map_yelp_label(example):
         0 = negative
         1 = neutral
         2 = positive
+
+    Mapping:
+        1–2 stars -> negative
+        3 stars   -> neutral
+        4–5 stars -> positive
     """
 
     original_label = example["label"]
@@ -64,13 +75,24 @@ def map_yelp_label(example):
 
 def tokenize_examples(examples):
     """
-    The tokenizer converts raw review text into input IDs and attention masks.
+    Convert raw review text into model inputs.
 
-    input_ids:
-        Numerical token IDs that the model can understand.
+    The tokenizer returns:
+        input_ids:
+            Numerical token IDs.
 
-    attention_mask:
-        Tells the model which tokens are real and which are padding.
+        attention_mask:
+            1 for real tokens, 0 for padding tokens.
+
+    We use:
+        truncation=True:
+            Cut reviews longer than MAX_LENGTH.
+
+        padding="max_length":
+            Pad shorter reviews to MAX_LENGTH.
+
+        max_length=128:
+            Keeps training reasonably fast for the hackathon.
     """
 
     return tokenizer(
@@ -87,11 +109,16 @@ def tokenize_examples(examples):
 
 def compute_metrics(eval_pred):
     """
-    Trainer gives us:
-        logits: raw model scores before softmax
-        labels: true labels
+    Compute evaluation metrics for the validation set.
 
-    We choose the class with the highest logit as the prediction.
+    Trainer gives us:
+        logits:
+            Raw model scores before softmax.
+
+        labels:
+            Correct class labels.
+
+    We convert logits into predicted classes using argmax.
     """
 
     logits, labels = eval_pred
@@ -123,26 +150,61 @@ if __name__ == "__main__":
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
+    print("=" * 80)
     print("Loading dataset...")
+    print("=" * 80)
 
     dataset = load_dataset("yelp_review_full")
 
-    train_dataset = dataset["train"].shuffle(seed=42).select(range(NUM_TRAIN_EXAMPLES))
-    validation_dataset = dataset["test"].shuffle(seed=42).select(range(NUM_VALIDATION_EXAMPLES))
+    print()
+    print("=" * 80)
+    print("Creating random train/validation subsets...")
+    print("=" * 80)
 
+    train_dataset = (
+        dataset["train"]
+        .shuffle(seed=42)
+        .select(range(NUM_TRAIN_EXAMPLES))
+    )
+
+    validation_dataset = (
+        dataset["test"]
+        .shuffle(seed=123)
+        .select(range(NUM_VALIDATION_EXAMPLES))
+    )
+
+    print(f"Training examples: {len(train_dataset)}")
+    print(f"Validation examples: {len(validation_dataset)}")
+
+    print()
+    print("=" * 80)
     print("Mapping 5-star Yelp labels into 3 sentiment labels...")
+    print("=" * 80)
 
     train_dataset = train_dataset.map(map_yelp_label)
     validation_dataset = validation_dataset.map(map_yelp_label)
 
+    print()
+    print("=" * 80)
     print("Loading tokenizer...")
+    print("=" * 80)
 
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
 
+    print()
+    print("=" * 80)
     print("Tokenizing datasets...")
+    print("=" * 80)
 
-    train_dataset = train_dataset.map(tokenize_examples, batched=True)
-    validation_dataset = validation_dataset.map(tokenize_examples, batched=True)
+    train_dataset = train_dataset.map(
+        tokenize_examples,
+        batched=True,
+    )
+
+    validation_dataset = validation_dataset.map(
+        tokenize_examples,
+        batched=True,
+    )
 
     train_dataset.set_format(
         type="torch",
@@ -154,7 +216,10 @@ if __name__ == "__main__":
         columns=["input_ids", "attention_mask", "label"],
     )
 
-    print("Loading model...")
+    print()
+    print("=" * 80)
+    print("Loading base model...")
+    print("=" * 80)
 
     model = AutoModelForSequenceClassification.from_pretrained(
         MODEL_NAME,
@@ -171,15 +236,31 @@ if __name__ == "__main__":
         },
     )
 
+    print()
+    print("=" * 80)
     print("Configuring LoRA...")
+    print("=" * 80)
 
     lora_config = LoraConfig(
         task_type=TaskType.SEQ_CLS,
         inference_mode=False,
+
+        # LoRA rank. Larger rank = more trainable parameters.
+        # r=8 is a reasonable small/medium value for this hackathon project.
         r=8,
+
+        # Common rule of thumb: alpha around 2 * r.
         lora_alpha=16,
+
+        # Dropout inside LoRA adapters for regularization.
         lora_dropout=0.1,
+
+        # DistilBERT attention projection layer names.
+        # q_lin = query projection
+        # v_lin = value projection
         target_modules=["q_lin", "v_lin"],
+
+        # Keep classification head trainable/saved.
         modules_to_save=["classifier", "pre_classifier"],
     )
 
@@ -188,25 +269,46 @@ if __name__ == "__main__":
     print("Trainable parameters after applying LoRA:")
     model.print_trainable_parameters()
 
+    print()
+    print("=" * 80)
     print("Setting up training arguments...")
+    print("=" * 80)
 
     training_args = TrainingArguments(
         output_dir=str(OUTPUT_DIR),
+
+        # Evaluate and save after each epoch.
         eval_strategy="epoch",
         save_strategy="epoch",
+
+        # LoRA often works well with a slightly larger LR than full fine-tuning.
         learning_rate=1e-4,
+
         per_device_train_batch_size=8,
         per_device_eval_batch_size=8,
+
+        # Keep this at 2 for hackathon speed.
+        # If you have time, 3 epochs may improve the classifier.
         num_train_epochs=2,
+
         weight_decay=0.01,
         logging_steps=50,
+
         load_best_model_at_end=True,
         metric_for_best_model="f1",
+        greater_is_better=True,
+
+        # Avoid W&B or other tracking prompts.
         report_to="none",
+
+        # Avoid MPS pinned-memory warning on Apple Silicon.
         dataloader_pin_memory=False,
     )
 
+    print()
+    print("=" * 80)
     print("Creating Trainer...")
+    print("=" * 80)
 
     trainer = Trainer(
         model=model,
@@ -216,18 +318,31 @@ if __name__ == "__main__":
         compute_metrics=compute_metrics,
     )
 
-    print("Training model with LoRA...")
+    print()
+    print("=" * 80)
+    print("Training random 10k LoRA sentiment classifier...")
+    print("=" * 80)
 
     trainer.train()
 
+    print()
+    print("=" * 80)
     print("Evaluating LoRA model...")
+    print("=" * 80)
 
     results = trainer.evaluate()
     print(results)
 
+    print()
+    print("=" * 80)
     print("Saving LoRA model and tokenizer...")
+    print("=" * 80)
 
     trainer.save_model(str(OUTPUT_DIR))
     tokenizer.save_pretrained(str(OUTPUT_DIR))
 
-    print(f"Done. LoRA model saved to {OUTPUT_DIR}")
+    print()
+    print("=" * 80)
+    print("Done.")
+    print("=" * 80)
+    print(f"LoRA model saved to: {OUTPUT_DIR}")

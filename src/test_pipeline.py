@@ -1,137 +1,173 @@
-from pathlib import Path
-
-import torch
-from transformers import AutoTokenizer, AutoModelForSequenceClassification
-from peft import PeftModel
-
+from sentiment_classifier import load_lora_classifier, predict_sentiment
 from retriever_faiss import FaissReviewRetriever
-from generate_response import generate_contextual_response
+from generate_response_remote import generate_contextual_response
 
 
 # ------------------------------------------------------------
-# 1. Basic configuration
+# 1. Print retrieved reviews
 # ------------------------------------------------------------
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-
-BASE_MODEL_NAME = "distilbert-base-uncased"
-LORA_MODEL_DIR = PROJECT_ROOT / "models" / "sentiment_classifier_lora"
-
-ID2LABEL = {
-    0: "negative",
-    1: "neutral",
-    2: "positive",
-}
-
-
-# ------------------------------------------------------------
-# 2. Load classifier
-# ------------------------------------------------------------
-
-def load_lora_classifier():
+def print_retrieved_reviews(retrieved_reviews):
     """
-    Load the base DistilBERT classifier and attach the trained LoRA adapter.
+    Print retrieved reviews in a readable way.
     """
 
-    tokenizer = AutoTokenizer.from_pretrained(str(LORA_MODEL_DIR))
+    for i, review in enumerate(retrieved_reviews, start=1):
+        text = review["text"].replace("\n", " ").strip()
 
-    base_model = AutoModelForSequenceClassification.from_pretrained(
-        BASE_MODEL_NAME,
-        num_labels=3,
-        id2label=ID2LABEL,
-        label2id={
-            "negative": 0,
-            "neutral": 1,
-            "positive": 2,
-        },
-    )
+        if len(text) > 500:
+            text = text[:500].rstrip() + "..."
 
-    model = PeftModel.from_pretrained(
-        base_model,
-        str(LORA_MODEL_DIR),
-    )
-
-    model.eval()
-
-    return tokenizer, model
+        print()
+        print(f"Retrieved Review {i}")
+        print("-" * 80)
+        print(f"Similarity score: {review['score']:.4f}")
+        print(f"Sentiment: {review['sentiment']}")
+        print(f"Original Yelp label: {review['label']}")
+        print(f"Text: {text}")
 
 
 # ------------------------------------------------------------
-# 3. Predict sentiment
+# 2. Load reusable pipeline components
 # ------------------------------------------------------------
 
-def predict_sentiment(text, tokenizer, model):
+def load_pipeline_components():
     """
-    Predict negative / neutral / positive sentiment for a single text.
+    Load reusable local components once.
+
+    OpenRouter is called remotely during generation, so there is no local
+    generator model to load.
     """
 
-    inputs = tokenizer(
-        text,
-        return_tensors="pt",
-        truncation=True,
-        padding=True,
-        max_length=128,
-    )
+    print("Loading LoRA sentiment classifier...")
+    classifier_tokenizer, classifier_model, classifier_device = load_lora_classifier()
 
-    with torch.no_grad():
-        outputs = model(**inputs)
-
-    logits = outputs.logits
-
-    predicted_class_id = torch.argmax(logits, dim=-1).item()
-
-    predicted_label = ID2LABEL[predicted_class_id]
-
-    return predicted_label
-
-
-# ------------------------------------------------------------
-# 4. Full pipeline test
-# ------------------------------------------------------------
-
-if __name__ == "__main__":
-
-    user_query = "The food arrived cold and the delivery took forever. Nobody answered when I called."
-
-    print("Loading classifier...")
-    tokenizer, model = load_lora_classifier()
-
-    print("Loading retriever...")
+    print()
+    print("Loading FAISS retriever...")
     retriever = FaissReviewRetriever()
 
+    return {
+        "classifier_tokenizer": classifier_tokenizer,
+        "classifier_model": classifier_model,
+        "classifier_device": classifier_device,
+        "retriever": retriever,
+    }
+
+
+# ------------------------------------------------------------
+# 3. Run full pipeline for one query
+# ------------------------------------------------------------
+
+def run_pipeline(user_query, components, top_k=3):
+    """
+    Run the full pipeline:
+
+        user query
+            ↓
+        LoRA sentiment classifier
+            ↓
+        predicted sentiment
+
+        user query + predicted sentiment
+            ↓
+        FAISS retrieval with sentiment filtering
+            ↓
+        similar reviews
+
+        user query + predicted sentiment + retrieved reviews
+            ↓
+        OpenRouter Llama generator
+            ↓
+        customer support response
+    """
+
+    print()
     print("Predicting sentiment...")
-    predicted_sentiment = predict_sentiment(user_query, tokenizer, model)
 
-    print("Retrieving similar reviews...")
-    retrieved_reviews = retriever.retrieve(user_query, top_k=3)
+    predicted_sentiment = predict_sentiment(
+        text=user_query,
+        tokenizer=components["classifier_tokenizer"],
+        model=components["classifier_model"],
+        device=components["classifier_device"],
+    )
 
-    print("Generating contextual response...")
-    result = generate_contextual_response(
+    print("Retrieving similar reviews with sentiment filtering...")
+
+    retrieved_reviews = components["retriever"].retrieve_with_sentiment_filter(
+        query=user_query,
+        sentiment=predicted_sentiment,
+        top_k=top_k,
+        candidate_k=20,
+    )
+
+    print("Generating contextual response with OpenRouter...")
+
+    generation_result = generate_contextual_response(
         user_query=user_query,
         predicted_sentiment=predicted_sentiment,
         retrieved_reviews=retrieved_reviews,
     )
 
-    print()
-    print("=" * 80)
-    print("USER QUERY")
-    print("=" * 80)
-    print(user_query)
+    return {
+        "user_query": user_query,
+        "predicted_sentiment": predicted_sentiment,
+        "retrieved_reviews": retrieved_reviews,
+        "generation_result": generation_result,
+    }
 
-    print()
-    print("=" * 80)
-    print("PREDICTED SENTIMENT")
-    print("=" * 80)
-    print(predicted_sentiment)
 
-    print()
-    print("=" * 80)
-    print("RETRIEVED CONTEXT")
-    print("=" * 80)
-    print(result["context_snippets"])
+# ------------------------------------------------------------
+# 4. Manual test
+# ------------------------------------------------------------
 
-    print()
-    print("=" * 80)
-    print("GENERATED RESPONSE")
-    print("=" * 80)
-    print(result["response"])
+if __name__ == "__main__":
+
+    test_queries = [
+        "The food arrived cold and the delivery took forever. Nobody answered when I called.",
+        "The meal was fine, nothing amazing, but the staff were polite.",
+        "The food was delicious, the service was friendly, and everything arrived quickly.",
+    ]
+
+    components = load_pipeline_components()
+
+    for query in test_queries:
+        result = run_pipeline(
+            user_query=query,
+            components=components,
+            top_k=3,
+        )
+
+        print()
+        print("=" * 100)
+        print("USER QUERY")
+        print("=" * 100)
+        print(result["user_query"])
+
+        print()
+        print("=" * 100)
+        print("PREDICTED SENTIMENT")
+        print("=" * 100)
+        print(result["predicted_sentiment"])
+
+        print()
+        print("=" * 100)
+        print("RETRIEVED REVIEWS")
+        print("=" * 100)
+        print_retrieved_reviews(result["retrieved_reviews"])
+
+        print()
+        print("=" * 100)
+        print("GENERATOR MODEL")
+        print("=" * 100)
+        print(result["generation_result"]["model"])
+
+        print()
+        print("=" * 100)
+        print("FINAL RESPONSE")
+        print("=" * 100)
+        print(result["generation_result"]["response"])
+
+        print()
+        print("#" * 100)
+        print("#" * 100)
+        print()
