@@ -156,7 +156,7 @@ def build_retrieved_context_for_display(retrieved_reviews, max_reviews=3, max_ch
 # 4. Build messages for remote LLM
 # ------------------------------------------------------------
 
-def build_generation_messages(user_query, predicted_sentiment, retrieved_reviews):
+def build_generation_messages(user_query, predicted_sentiment):
     """
     Build chat messages for the OpenRouter model.
 
@@ -367,7 +367,6 @@ def generate_contextual_response(
     messages = build_generation_messages(
         user_query=user_query,
         predicted_sentiment=predicted_sentiment,
-        retrieved_reviews=retrieved_reviews,
     )
 
     raw_response = call_openrouter(messages)
